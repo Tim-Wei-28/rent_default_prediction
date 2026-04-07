@@ -345,11 +345,13 @@ class ApplicantInput(BaseModel):
 # Output schema
 # ---------------------------------------------------------------------------
 
-RiskLabel = Literal["Strong", "Good", "Limited", "Concerns", "Insufficient Data"]
+RiskLabel = Literal["Low Risk", "Moderate Risk", "Elevated Risk", "High Risk", "Insufficient Data"]
 
 
 class PredictionOutput(BaseModel):
-    risk_label: RiskLabel
+    risk_label: RiskLabel = Field(
+        description="Risk indicator label: Low Risk / Moderate Risk / Elevated Risk / High Risk."
+    )
     default_probability: float = Field(
         description="Model's estimated probability of default (0.0–1.0)."
     )
@@ -491,32 +493,65 @@ def _build_tier2_row(inp: ApplicantInput) -> pd.DataFrame:
 # Risk label mapping
 # ---------------------------------------------------------------------------
 
-def _risk_label(prob: float) -> tuple[RiskLabel, str]:
-    """Map default probability to a human-readable risk label + explanation."""
-    if prob < 0.15:
-        return (
-            "Strong",
-            "Low predicted default risk. The applicant's profile is consistent with "
-            "reliable rent payment.",
-        )
-    elif prob < 0.25:
-        return (
-            "Good",
-            "Below-average predicted default risk. Minor risk factors are present "
-            "but the overall profile is positive.",
-        )
-    elif prob < 0.40:
-        return (
-            "Limited",
-            "Moderate predicted default risk. Some risk factors are present; "
-            "consider requesting a guarantor or additional references.",
-        )
+def _risk_label(prob: float, tier: int) -> tuple[RiskLabel, str]:
+    """Map default probability to a human-readable risk label + explanation.
+
+    Tier 1 thresholds (self-reported data only — wider bands reflect lower precision):
+      < 46%  → Low Risk
+      46–60% → Moderate Risk
+      ≥ 60%  → High Risk
+
+    Tier 2 thresholds (bureau data — tighter bands reflect higher model confidence):
+      < 15%  → Low Risk
+      15–25% → Moderate Risk
+      25–40% → Elevated Risk
+      ≥ 40%  → High Risk
+    """
+    if tier == 1:
+        if prob < 0.46:
+            return (
+                "Low Risk",
+                "The applicant's profile is consistent with reliable rent payment. "
+                "Proceed with standard referencing.",
+            )
+        elif prob < 0.60:
+            return (
+                "Moderate Risk",
+                "Some risk factors are present. Consider additional referencing "
+                "before proceeding.",
+            )
+        else:
+            return (
+                "High Risk",
+                "Multiple risk factors identified. Detailed manual due diligence "
+                "is strongly recommended before accepting this applicant.",
+            )
     else:
-        return (
-            "Concerns",
-            "Elevated predicted default risk. Multiple risk factors identified; "
-            "further due diligence is strongly recommended.",
-        )
+        # Tier 2 — bureau data, tighter thresholds
+        if prob < 0.15:
+            return (
+                "Low Risk",
+                "The applicant's profile is consistent with reliable rent payment. "
+                "Proceed with standard referencing.",
+            )
+        elif prob < 0.25:
+            return (
+                "Moderate Risk",
+                "Below-average predicted default risk. Minor risk factors are present "
+                "but the overall profile is positive.",
+            )
+        elif prob < 0.40:
+            return (
+                "Elevated Risk",
+                "Several risk factors are present. Consider requesting a guarantor "
+                "or additional references before proceeding.",
+            )
+        else:
+            return (
+                "High Risk",
+                "Multiple risk factors identified. Detailed manual due diligence "
+                "is strongly recommended before accepting this applicant.",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +598,7 @@ def predict(inp: ApplicantInput) -> PredictionOutput:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 
-    label, explanation = _risk_label(prob)
+    label, explanation = _risk_label(prob, tier)
 
     return PredictionOutput(
         risk_label=label,

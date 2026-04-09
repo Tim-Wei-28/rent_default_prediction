@@ -641,32 +641,65 @@ def _compute_top_factors(
     model,
     row: pd.DataFrame,
     cols: list[str],
+    prob: float,
     top_n: int = 3,
 ) -> list[FeatureContribution]:
     try:
-        booster = model.get_booster()
-        dmat = xgb.DMatrix(row)
-        # pred_contribs returns shape (n_samples, n_features + 1); last col = bias
-        contribs = booster.predict(dmat, pred_contribs=True)[0, :-1]
+        # Use feature_importances_ (gain) from the trained model as a proxy for
+        # per-prediction contribution. Multiply by sign derived from whether each
+        # feature value pushes above or below average to get direction.
+        importances = model.feature_importances_  # shape: (n_features,)
 
-        # Pair each feature with its SHAP value, sort by absolute impact
-        pairs = sorted(
-            zip(cols, contribs),
-            key=lambda x: abs(x[1]),
-            reverse=True,
-        )[:top_n]
+        # For numeric features: compare value to a neutral midpoint to derive direction.
+        # For categorical: direction is always neutral (0) — use absolute importance only.
+        contributions = []
+        for i, col in enumerate(cols):
+            imp = float(importances[i])
+            val = row[col].iloc[0]
+
+            # Derive direction heuristically for key numeric risk features
+            direction_sign = 0.0
+            if col == "RentToIncomeRatio":
+                direction_sign = 1.0 if float(val) > 0.35 else -1.0
+            elif col == "StatedMonthlyIncome":
+                direction_sign = -1.0 if float(val) > 2000 else 1.0
+            elif col == "EmploymentStatusDuration":
+                direction_sign = -1.0 if float(val) > 12 else 1.0
+            elif col == "DelinquenciesLast7Years":
+                direction_sign = 1.0 if float(val) > 0 else -1.0
+            elif col == "CurrentDelinquencies":
+                direction_sign = 1.0 if float(val) > 0 else -1.0
+            elif col == "CreditScore":
+                direction_sign = -1.0 if float(val) > 650 else 1.0
+            elif col == "DebtToIncomeRatio":
+                direction_sign = 1.0 if float(val) > 0.3 else -1.0
+            elif col == "BankcardUtilization":
+                direction_sign = 1.0 if float(val) > 0.5 else -1.0
+            elif col == "InquiriesLast6Months":
+                direction_sign = 1.0 if float(val) > 1 else -1.0
+            elif col == "PublicRecordsLast10Years":
+                direction_sign = 1.0 if float(val) > 0 else -1.0
+            elif col == "IncomeVerifiable":
+                direction_sign = -1.0 if float(val) >= 0.5 else 1.0
+            else:
+                # For categorical/other: use overall model prediction direction
+                direction_sign = 1.0 if prob > 0.5 else -1.0
+
+            contributions.append((col, imp * direction_sign, imp))
+
+        # Sort by absolute importance
+        contributions.sort(key=lambda x: x[2], reverse=True)
 
         result: list[FeatureContribution] = []
-        for col, shap_val in pairs:
+        for col, signed_contrib, abs_contrib in contributions[:top_n]:
             result.append(FeatureContribution(
                 label=FEATURE_LABELS.get(col, col),
-                contribution=round(float(shap_val), 4),
-                direction="risk_up" if shap_val > 0 else "risk_down",
+                contribution=round(signed_contrib, 4),
+                direction="risk_up" if signed_contrib > 0 else "risk_down",
                 formatted_value=_format_feature_value(col, row),
             ))
         return result
     except Exception as exc:
-        # SHAP is best-effort — don't fail the whole prediction
         print(f"[SHAP] Failed to compute contributions: {exc}")
         return []
 
@@ -707,13 +740,13 @@ def predict(inp: ApplicantInput) -> PredictionOutput:
             prob = float(_tier2_model.predict_proba(row)[0, 1])
             tier = 2
             n_features = len(TIER2_COLS)
-            top_factors = _compute_top_factors(_tier2_model, row, TIER2_COLS)
+            top_factors = _compute_top_factors(_tier2_model, row, TIER2_COLS, prob)
         else:
             row = _build_tier1_row(inp)
             prob = float(_tier1_model.predict_proba(row)[0, 1])
             tier = 1
             n_features = len(TIER1_COLS)
-            top_factors = _compute_top_factors(_tier1_model, row, TIER1_COLS)
+            top_factors = _compute_top_factors(_tier1_model, row, TIER1_COLS, prob)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 

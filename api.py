@@ -720,6 +720,17 @@ def _has_bureau_data(inp: ApplicantInput) -> bool:
     return sum(f is not None for f in tier2_fields) >= 2
 
 
+@app.get("/debug-importances", summary="Debug: show top feature importances")
+def debug_importances() -> dict:
+    if _tier1_model is None:
+        return {"error": "model not loaded"}
+    try:
+        imps = _tier1_model.feature_importances_.tolist()
+        return {"tier1_importances": dict(zip(TIER1_COLS, imps))}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 @app.post("/predict", response_model=PredictionOutput, summary="Predict rent default risk")
 def predict(inp: ApplicantInput) -> PredictionOutput:
     """

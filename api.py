@@ -758,13 +758,13 @@ def predict(inp: ApplicantInput) -> PredictionOutput:
             prob = float(_tier2_model.predict_proba(row)[0, 1])
             tier = 2
             n_features = len(TIER2_COLS)
-            top_factors = _compute_top_factors(_tier2_model, row, TIER2_COLS, prob)
+            top_factors = _compute_top_factors(_tier2_model, row, TIER2_COLS, prob, top_n=5)
         else:
             row = _build_tier1_row(inp)
             prob = float(_tier1_model.predict_proba(row)[0, 1])
             tier = 1
             n_features = len(TIER1_COLS)
-            top_factors = _compute_top_factors(_tier1_model, row, TIER1_COLS, prob)
+            top_factors = _compute_top_factors(_tier1_model, row, TIER1_COLS, prob, top_n=5)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 

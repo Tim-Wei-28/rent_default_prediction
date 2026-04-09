@@ -637,6 +637,14 @@ def _format_feature_value(col: str, row: pd.DataFrame) -> str:
     return str(val)
 
 
+def _get_xgb_estimator(model):
+    """Unwrap sklearn Pipeline to get the underlying XGBoost estimator."""
+    if hasattr(model, 'steps'):
+        # It's a Pipeline — last step is the estimator
+        return model.steps[-1][1]
+    return model
+
+
 def _compute_top_factors(
     model,
     row: pd.DataFrame,
@@ -645,10 +653,8 @@ def _compute_top_factors(
     top_n: int = 3,
 ) -> list[FeatureContribution]:
     try:
-        # Use feature_importances_ (gain) from the trained model as a proxy for
-        # per-prediction contribution. Multiply by sign derived from whether each
-        # feature value pushes above or below average to get direction.
-        importances = model.feature_importances_  # shape: (n_features,)
+        estimator = _get_xgb_estimator(model)
+        importances = estimator.feature_importances_  # shape: (n_features,)
 
         # For numeric features: compare value to a neutral midpoint to derive direction.
         # For categorical: direction is always neutral (0) — use absolute importance only.
@@ -725,7 +731,8 @@ def debug_importances() -> dict:
     if _tier1_model is None:
         return {"error": "model not loaded"}
     try:
-        imps = _tier1_model.feature_importances_.tolist()
+        est = _get_xgb_estimator(_tier1_model)
+        imps = est.feature_importances_.tolist()
         return {"tier1_importances": dict(zip(TIER1_COLS, imps))}
     except Exception as exc:
         return {"error": str(exc)}

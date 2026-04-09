@@ -22,6 +22,7 @@ from typing import Optional, Literal
 import joblib
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -348,6 +349,13 @@ class ApplicantInput(BaseModel):
 RiskLabel = Literal["Low Risk", "Moderate Risk", "Elevated Risk", "High Risk", "Insufficient Data"]
 
 
+class FeatureContribution(BaseModel):
+    label: str = Field(description="Human-readable feature name.")
+    contribution: float = Field(description="SHAP value (positive = increases risk, negative = decreases).")
+    direction: str = Field(description="'risk_up' or 'risk_down'.")
+    formatted_value: str = Field(description="Formatted actual value of the feature.")
+
+
 class PredictionOutput(BaseModel):
     risk_label: RiskLabel = Field(
         description="Risk indicator label: Low Risk / Moderate Risk / Elevated Risk / High Risk."
@@ -358,6 +366,10 @@ class PredictionOutput(BaseModel):
     tier_used: Literal[1, 2]
     features_used: int
     explanation: str
+    top_factors: list[FeatureContribution] = Field(
+        default=[],
+        description="Top 3 most influential features with their SHAP contributions."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +567,111 @@ def _risk_label(prob: float, tier: int) -> tuple[RiskLabel, str]:
 
 
 # ---------------------------------------------------------------------------
+# SHAP helpers
+# ---------------------------------------------------------------------------
+
+# Human-readable labels for each feature column
+FEATURE_LABELS: dict[str, str] = {
+    "StatedMonthlyIncome":              "Monthly income",
+    "EmploymentStatusDuration":         "Employment duration",
+    "MonthlyLoanPayment":               "Monthly rent",
+    "RentToIncomeRatio":                "Rent-to-income ratio",
+    "IncomeVerifiable":                 "Income verified",
+    "EmploymentStatus":                 "Employment status",
+    "IncomeRange":                      "Income bracket",
+    "CreditHistoryMonths":              "Credit history length",
+    "MonthlyDebtServiceRatio":          "Monthly debt service ratio",
+    "DelinquenciesLast7Years":          "Delinquencies (7 yrs)",
+    "CurrentDelinquencies":             "Current delinquencies",
+    "AmountDelinquent":                 "Amount delinquent",
+    "PublicRecordsLast10Years":         "Public records (10 yrs)",
+    "PublicRecordsLast12Months":        "Public records (12 mo)",
+    "InquiriesLast6Months":             "Credit inquiries (6 mo)",
+    "TotalInquiries":                   "Total credit inquiries",
+    "TradesOpenedLast6Months":          "New accounts (6 mo)",
+    "OpenRevolvingMonthlyPayment":      "Revolving payments",
+    "RevolvingCreditBalance":           "Revolving balance",
+    "AvailableBankcardCredit":          "Available credit",
+    "OpenRevolvingAccounts":            "Open revolving accounts",
+    "DelinquencyRatio":                 "Delinquency ratio",
+    "RecentInquiryRatio":               "Recent inquiry ratio",
+    "CreditScore":                      "Credit score",
+    "DebtToIncomeRatio":                "Debt-to-income ratio",
+    "BankcardUtilization":              "Card utilisation",
+    "TradesNeverDelinquent (percentage)": "Trades never delinquent",
+    "OpenCreditLines":                  "Open credit lines",
+    "CurrentCreditLines":               "Current credit lines",
+    "TotalCreditLinespast7years":       "Credit lines (7 yrs)",
+    "TotalTrades":                      "Total trades",
+    "AvailableCreditBuffer":            "Credit buffer",
+    "UtilisationXInquiries":            "Utilisation × inquiries",
+}
+
+
+def _format_feature_value(col: str, row: pd.DataFrame) -> str:
+    val = row[col].iloc[0]
+    if col == "StatedMonthlyIncome":
+        return f"£{float(val):,.0f}/mo"
+    if col == "RentToIncomeRatio":
+        return f"{float(val)*100:.0f}%"
+    if col == "MonthlyDebtServiceRatio":
+        return f"{float(val)*100:.0f}%"
+    if col == "EmploymentStatusDuration":
+        return f"{float(val):.0f} months"
+    if col == "CreditHistoryMonths":
+        return f"{float(val):.0f} months"
+    if col == "MonthlyLoanPayment":
+        return f"£{float(val):,.0f}/mo"
+    if col == "CreditScore":
+        return f"{float(val):.0f}"
+    if col == "DebtToIncomeRatio":
+        return f"{float(val)*100:.0f}%"
+    if col == "BankcardUtilization":
+        return f"{float(val)*100:.0f}%"
+    if col in ("TradesNeverDelinquent (percentage)", "DelinquencyRatio", "RecentInquiryRatio", "AvailableCreditBuffer"):
+        return f"{float(val)*100:.0f}%"
+    if col == "IncomeVerifiable":
+        return "Yes" if float(val) >= 0.5 else "No"
+    if col in ("RevolvingCreditBalance", "AvailableBankcardCredit", "OpenRevolvingMonthlyPayment", "AmountDelinquent"):
+        return f"£{float(val):,.0f}"
+    return str(val)
+
+
+def _compute_top_factors(
+    model,
+    row: pd.DataFrame,
+    cols: list[str],
+    top_n: int = 3,
+) -> list[FeatureContribution]:
+    try:
+        booster = model.get_booster()
+        dmat = xgb.DMatrix(row)
+        # pred_contribs returns shape (n_samples, n_features + 1); last col = bias
+        contribs = booster.predict(dmat, pred_contribs=True)[0, :-1]
+
+        # Pair each feature with its SHAP value, sort by absolute impact
+        pairs = sorted(
+            zip(cols, contribs),
+            key=lambda x: abs(x[1]),
+            reverse=True,
+        )[:top_n]
+
+        result: list[FeatureContribution] = []
+        for col, shap_val in pairs:
+            result.append(FeatureContribution(
+                label=FEATURE_LABELS.get(col, col),
+                contribution=round(float(shap_val), 4),
+                direction="risk_up" if shap_val > 0 else "risk_down",
+                formatted_value=_format_feature_value(col, row),
+            ))
+        return result
+    except Exception as exc:
+        # SHAP is best-effort — don't fail the whole prediction
+        print(f"[SHAP] Failed to compute contributions: {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Prediction endpoint
 # ---------------------------------------------------------------------------
 
@@ -590,11 +707,13 @@ def predict(inp: ApplicantInput) -> PredictionOutput:
             prob = float(_tier2_model.predict_proba(row)[0, 1])
             tier = 2
             n_features = len(TIER2_COLS)
+            top_factors = _compute_top_factors(_tier2_model, row, TIER2_COLS)
         else:
             row = _build_tier1_row(inp)
             prob = float(_tier1_model.predict_proba(row)[0, 1])
             tier = 1
             n_features = len(TIER1_COLS)
+            top_factors = _compute_top_factors(_tier1_model, row, TIER1_COLS)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 
@@ -606,6 +725,7 @@ def predict(inp: ApplicantInput) -> PredictionOutput:
         tier_used=tier,
         features_used=n_features,
         explanation=explanation,
+        top_factors=top_factors,
     )
 
 

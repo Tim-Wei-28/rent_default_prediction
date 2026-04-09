@@ -650,58 +650,50 @@ def _compute_top_factors(
     row: pd.DataFrame,
     cols: list[str],
     prob: float,
-    top_n: int = 3,
+    top_n: int = 5,
 ) -> list[FeatureContribution]:
     try:
         estimator = _get_xgb_estimator(model)
-        importances = estimator.feature_importances_  # shape: (n_features,)
+        booster = estimator.get_booster()
 
-        # For numeric features: compare value to a neutral midpoint to derive direction.
-        # For categorical: direction is always neutral (0) — use absolute importance only.
-        contributions = []
-        for i, col in enumerate(cols):
-            imp = float(importances[i])
-            val = row[col].iloc[0]
+        # If the model is a Pipeline, transform the row through all steps except
+        # the final estimator first, so the booster receives encoded numeric data.
+        if hasattr(model, 'steps') and len(model.steps) > 1:
+            preprocessor = model[:-1]  # all steps except last
+            transformed = preprocessor.transform(row)
+            # Get feature names after preprocessing if available
+            try:
+                feature_names = preprocessor.get_feature_names_out().tolist()
+            except Exception:
+                feature_names = [f"f{i}" for i in range(transformed.shape[1])]
+            dmat = xgb.DMatrix(transformed, feature_names=feature_names)
+        else:
+            dmat = xgb.DMatrix(row, feature_names=cols)
 
-            # Derive direction heuristically for key numeric risk features
-            direction_sign = 0.0
-            if col == "RentToIncomeRatio":
-                direction_sign = 1.0 if float(val) > 0.35 else -1.0
-            elif col == "StatedMonthlyIncome":
-                direction_sign = -1.0 if float(val) > 2000 else 1.0
-            elif col == "EmploymentStatusDuration":
-                direction_sign = -1.0 if float(val) > 12 else 1.0
-            elif col == "DelinquenciesLast7Years":
-                direction_sign = 1.0 if float(val) > 0 else -1.0
-            elif col == "CurrentDelinquencies":
-                direction_sign = 1.0 if float(val) > 0 else -1.0
-            elif col == "CreditScore":
-                direction_sign = -1.0 if float(val) > 650 else 1.0
-            elif col == "DebtToIncomeRatio":
-                direction_sign = 1.0 if float(val) > 0.3 else -1.0
-            elif col == "BankcardUtilization":
-                direction_sign = 1.0 if float(val) > 0.5 else -1.0
-            elif col == "InquiriesLast6Months":
-                direction_sign = 1.0 if float(val) > 1 else -1.0
-            elif col == "PublicRecordsLast10Years":
-                direction_sign = 1.0 if float(val) > 0 else -1.0
-            elif col == "IncomeVerifiable":
-                direction_sign = -1.0 if float(val) >= 0.5 else 1.0
-            else:
-                # For categorical/other: use overall model prediction direction
-                direction_sign = 1.0 if prob > 0.5 else -1.0
+        # pred_contribs returns shape (n_samples, n_features + 1); last col = bias
+        contribs = booster.predict(dmat, pred_contribs=True)[0, :-1]
+        feat_names = dmat.feature_names or [f"f{i}" for i in range(len(contribs))]
 
-            contributions.append((col, imp * direction_sign, imp))
+        # Map preprocessed feature names back to original cols where possible
+        # by finding which preprocessed features correspond to original cols
+        col_to_shap: dict[str, float] = {}
+        for orig_col in cols:
+            # Sum contributions of all preprocessed features derived from this col
+            total = 0.0
+            for fn, sv in zip(feat_names, contribs):
+                if orig_col.lower().replace(' ', '_') in fn.lower().replace(' ', '_'):
+                    total += float(sv)
+            col_to_shap[orig_col] = total
 
-        # Sort by absolute importance
-        contributions.sort(key=lambda x: x[2], reverse=True)
+        # Sort by absolute SHAP value
+        sorted_cols = sorted(col_to_shap.items(), key=lambda x: abs(x[1]), reverse=True)
 
         result: list[FeatureContribution] = []
-        for col, signed_contrib, abs_contrib in contributions[:top_n]:
+        for col, shap_val in sorted_cols[:top_n]:
             result.append(FeatureContribution(
                 label=FEATURE_LABELS.get(col, col),
-                contribution=round(signed_contrib, 4),
-                direction="risk_up" if signed_contrib > 0 else "risk_down",
+                contribution=round(shap_val, 4),
+                direction="risk_up" if shap_val > 0 else "risk_down",
                 formatted_value=_format_feature_value(col, row),
             ))
         return result

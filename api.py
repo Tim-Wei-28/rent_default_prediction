@@ -656,43 +656,34 @@ def _compute_top_factors(
         estimator = _get_xgb_estimator(model)
         booster = estimator.get_booster()
 
-        # If the model is a Pipeline, transform the row through all steps except
-        # the final estimator first, so the booster receives encoded numeric data.
+        # Transform through preprocessor steps (everything except the final estimator)
         if hasattr(model, 'steps') and len(model.steps) > 1:
-            preprocessor = model[:-1]  # all steps except last
-            transformed = preprocessor.transform(row)
-            # Get feature names after preprocessing if available
-            try:
-                feature_names = preprocessor.get_feature_names_out().tolist()
-            except Exception:
-                feature_names = [f"f{i}" for i in range(transformed.shape[1])]
-            dmat = xgb.DMatrix(transformed, feature_names=feature_names)
+            transformed = model[:-1].transform(row)
         else:
-            dmat = xgb.DMatrix(row, feature_names=cols)
+            transformed = row.values
 
-        # pred_contribs returns shape (n_samples, n_features + 1); last col = bias
-        contribs = booster.predict(dmat, pred_contribs=True)[0, :-1]
-        feat_names = dmat.feature_names or [f"f{i}" for i in range(len(contribs))]
+        transformed = np.array(transformed, dtype=np.float32)
+        # Use sanitised feature names (no special chars) to avoid DMatrix issues
+        safe_names = [c.replace(' ', '_').replace('(', '').replace(')', '') for c in cols]
+        # Pad or trim if preprocessor changed the feature count
+        n = transformed.shape[1]
+        safe_names = safe_names[:n] + [f"f{i}" for i in range(len(safe_names), n)]
 
-        # Map preprocessed feature names back to original cols where possible
-        # by finding which preprocessed features correspond to original cols
-        col_to_shap: dict[str, float] = {}
-        for orig_col in cols:
-            # Sum contributions of all preprocessed features derived from this col
-            total = 0.0
-            for fn, sv in zip(feat_names, contribs):
-                if orig_col.lower().replace(' ', '_') in fn.lower().replace(' ', '_'):
-                    total += float(sv)
-            col_to_shap[orig_col] = total
+        dmat = xgb.DMatrix(transformed, feature_names=safe_names)
+        contribs = booster.predict(dmat, pred_contribs=True)[0, :-1]  # drop bias
 
-        # Sort by absolute SHAP value
-        sorted_cols = sorted(col_to_shap.items(), key=lambda x: abs(x[1]), reverse=True)
+        # Map back to original cols by position
+        pairs = sorted(
+            zip(cols[:len(contribs)], contribs),
+            key=lambda x: abs(x[1]),
+            reverse=True,
+        )
 
         result: list[FeatureContribution] = []
-        for col, shap_val in sorted_cols[:top_n]:
+        for col, shap_val in pairs[:top_n]:
             result.append(FeatureContribution(
                 label=FEATURE_LABELS.get(col, col),
-                contribution=round(shap_val, 4),
+                contribution=round(float(shap_val), 4),
                 direction="risk_up" if shap_val > 0 else "risk_down",
                 formatted_value=_format_feature_value(col, row),
             ))
